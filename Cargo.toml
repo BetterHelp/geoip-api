@@ -17,7 +17,6 @@ chrono = "0.4"
 env_logger = "0.7"
 flate2 = "1.0"
 log = "0.4"
-maxminddb = { version = "0.13.0" }
 md5 = "0.7"
 prometheus = "0.8"
 serde = "1"
@@ -36,3 +35,7 @@ default_features = false
 version = "0.10"
 default_features = false
 features = ["rustls-tls"]
+
+[dependencies.maxminddb]
+path = "../maxminddb-rust"
+features = ["unsafe-str-decode"]

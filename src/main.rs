@@ -12,7 +12,7 @@ use prometheus::{opts, IntCounter, IntGauge};
 
 use std::net::SocketAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::RwLock;
 
 use structopt::StructOpt;
 
@@ -20,7 +20,6 @@ use error::GeoIPError;
 
 use geoipupdate::GeoIPUpdater;
 use geoipupdate::GeoIPUpdaterMetrics;
-use lru_time_cache::LruCache;
 
 mod error;
 mod geoipupdate;
@@ -72,13 +71,13 @@ fn get_language(lang: Option<String>) -> String {
     lang.unwrap_or_else(|| String::from("en"))
 }
 
-async fn index(
+async fn index<'a>(
     _req: HttpRequest,
     db: web::Data<RwLock<MaxMindReader>>,
-    lru: web::Data<Arc<Mutex<LruCache<String, City>>>>,
     web::Query(query): web::Query<QueryParams>,
 ) -> Result<HttpResponse, GeoIPError> {
     let language = get_language(query.lang);
+    let language = language.as_str();
     let ip_address = query
         .ip
         .filter(|ip_address| {
@@ -86,27 +85,14 @@ async fn index(
         })
         .ok_or(GeoIPError::ParseError)?;
 
-    let cached_city = {
-        let mut open_lru = lru.as_ref().lock().map_err(|_| GeoIPError::PoisonError)?;
-        open_lru.get(&ip_address).cloned()
-    };
+    let db_opt = db.read().map_err(|_| GeoIPError::PoisonError)?;
 
-    let geoip = match cached_city {
-        Some(city) => city,
-        None => {
-            let db_opt = db.as_ref().read().map_err(|_| GeoIPError::PoisonError)?;
-
-            let geoip: City = if let Some(db) = &*db_opt {
-                // we can unwrap here because we parsed previously
-                db.lookup(ip_address.parse().unwrap())
-            } else {
-                Err(GeoIPError::DatabaseNotFound)?
-            }?;
-            let mut open_lru = lru.as_ref().lock().map_err(|_| GeoIPError::PoisonError)?;
-            open_lru.insert(ip_address.clone(), geoip.clone());
-            geoip
-        }
-    };
+    let geoip: City = if let Some(db) = &*db_opt {
+        // we can unwrap here because we parsed previously
+        db.lookup(ip_address.parse().unwrap())
+    } else {
+        Err(GeoIPError::DatabaseNotFound)?
+    }?;
 
     let region = geoip
         .subdivisions
@@ -132,68 +118,59 @@ async fn index(
             .as_ref()
             .and_then(|loc| loc.longitude.as_ref())
             .unwrap_or(&0.0),
-        postal_code: geoip
-            .postal
-            .as_ref()
-            .and_then(|postal| postal.code.as_ref())
-            .map(String::as_str)
-            .unwrap_or(""),
+        postal_code: geoip.postal.and_then(|postal| postal.code).unwrap_or(""),
         continent_code: geoip
             .continent
             .as_ref()
-            .and_then(|cont| cont.code.as_ref())
-            .map(String::as_str)
+            .and_then(|cont| cont.code)
             .unwrap_or(""),
         continent_name: geoip
             .continent
             .as_ref()
             .and_then(|cont| cont.names.as_ref())
-            .and_then(|names| names.get(&language))
-            .map(String::as_str)
+            .and_then(|names| names.get(language))
+            .map(|x| *x)
             .unwrap_or(""),
         country_code: geoip
             .country
             .as_ref()
-            .and_then(|country| country.iso_code.as_ref())
-            .map(String::as_str)
+            .and_then(|country| country.iso_code)
             .unwrap_or(""),
         country_name: geoip
             .country
             .as_ref()
             .and_then(|country| country.names.as_ref())
-            .and_then(|names| names.get(&language))
-            .map(String::as_str)
+            .and_then(|names| names.get(language))
+            .map(|x| *x)
             .unwrap_or(""),
-        region_code: region
-            .and_then(|subdiv| subdiv.iso_code.as_ref())
-            .map(String::as_str)
-            .unwrap_or(""),
+        region_code: region.and_then(|subdiv| subdiv.iso_code).unwrap_or(""),
         region_name: region
+            .as_ref()
             .and_then(|subdiv| subdiv.names.as_ref())
-            .and_then(|names| names.get(&language))
-            .map(String::as_str)
+            .and_then(|names| names.get(language))
+            .map(|x| *x)
             .unwrap_or(""),
         province_code: province
-            .and_then(|subdiv| subdiv.iso_code.as_ref())
-            .map(String::as_str)
+            .as_ref()
+            .and_then(|subdiv| subdiv.iso_code)
             .unwrap_or(""),
         province_name: province
+            .as_ref()
             .and_then(|subdiv| subdiv.names.as_ref())
-            .and_then(|names| names.get(&language))
-            .map(String::as_str)
+            .and_then(|names| names.get(language))
+            .map(|x| *x)
             .unwrap_or(""),
         city_name: geoip
             .city
             .as_ref()
             .and_then(|city| city.names.as_ref())
             .and_then(|names| names.get(&language))
-            .map(String::as_str)
+            .map(|x| *x)
             .unwrap_or(""),
         timezone: geoip
             .location
             .as_ref()
-            .and_then(|loc| loc.time_zone.as_ref())
-            .map(String::as_str)
+            .and_then(|loc| loc.time_zone)
             .unwrap_or(""),
     };
 
@@ -204,7 +181,7 @@ async fn health(
     _req: HttpRequest,
     db: web::Data<RwLock<MaxMindReader>>,
 ) -> Result<&'static str, GeoIPError> {
-    let db_opt = db.as_ref().read().map_err(|_| GeoIPError::PoisonError)?;
+    let db_opt = db.read().map_err(|_| GeoIPError::PoisonError)?;
 
     if let Some(_db) = &*db_opt {
         Ok("OK")
@@ -257,11 +234,6 @@ async fn main() {
         .register(Box::new(error_count.clone()))
         .unwrap();
 
-    let ttl = ::std::time::Duration::from_secs(3600);
-
-    let lru = web::Data::new(Arc::new(Mutex::new(
-        LruCache::<String, City>::with_expiry_duration_and_capacity(ttl, 2000),
-    )));
     let db: web::Data<RwLock<MaxMindReader>> = web::Data::new(RwLock::new(None));
 
     let updater_metrics = GeoIPUpdaterMetrics::new(
@@ -285,7 +257,6 @@ async fn main() {
     HttpServer::new(move || {
         App::new()
             .app_data(db.clone())
-            .app_data(lru.clone())
             .wrap(Cors::new().send_wildcard().finish())
             .wrap(prometheus.clone())
             .route("/", web::route().to(index))
@@ -295,5 +266,5 @@ async fn main() {
     .unwrap_or_else(|_| panic!("Can not bind to {}", listen_addr))
     .run()
     .await
-    .unwrap();
+    .unwrap()
 }
